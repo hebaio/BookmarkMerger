@@ -179,7 +179,31 @@ class BookmarkMergerApp(QWidget):
 
         self.chk_deduplicate = QCheckBox("Remove Duplicates")
         self.chk_deduplicate.setChecked(True)
+        self.chk_deduplicate.stateChanged.connect(self.toggle_criteria)
         layout.addWidget(self.chk_deduplicate)
+        
+        # Deduplication Criteria Layout
+        self.criteria_group = QWidget()
+        crit_layout = QHBoxLayout()
+        crit_layout.setContentsMargins(20, 0, 0, 0) # Indent
+        
+        self.chk_crit_folder = QCheckBox("By Folder")
+        self.chk_crit_folder.setToolTip("If checked, bookmarks in different folders are NOT duplicates.")
+        crit_layout.addWidget(self.chk_crit_folder)
+        
+        self.chk_crit_title = QCheckBox("By Title")
+        self.chk_crit_title.setToolTip("If checked, bookmarks must have matching Titles to be duplicates.")
+        crit_layout.addWidget(self.chk_crit_title)
+        
+        self.chk_crit_url = QCheckBox("By URL")
+        self.chk_crit_url.setChecked(True)
+        self.chk_crit_url.setToolTip("If checked, bookmarks must have matching URLs to be duplicates.")
+        crit_layout.addWidget(self.chk_crit_url)
+        
+        crit_layout.addStretch()
+        self.criteria_group.setLayout(crit_layout)
+        layout.addWidget(self.criteria_group)
+
         
         self.btn_merge = QPushButton("Merge and Save To...")
         self.btn_merge.clicked.connect(self.merge_bookmarks)
@@ -191,6 +215,9 @@ class BookmarkMergerApp(QWidget):
         layout.addWidget(self.status_lbl)
         
         self.setLayout(layout)
+
+    def toggle_criteria(self, state):
+        self.criteria_group.setEnabled(state == Qt.Checked.value)
 
     def add_files(self):
         files, _ = QFileDialog.getOpenFileNames(
@@ -232,6 +259,15 @@ class BookmarkMergerApp(QWidget):
         if not self.file_list:
             QMessageBox.warning(self, "No Files", "Please add at least one bookmark file to merge.")
             return
+            
+        remove_duplicates = self.chk_deduplicate.isChecked()
+        crit_folder = self.chk_crit_folder.isChecked()
+        crit_title = self.chk_crit_title.isChecked()
+        crit_url = self.chk_crit_url.isChecked()
+        
+        if remove_duplicates and not (crit_folder or crit_title or crit_url):
+            QMessageBox.warning(self, "Criteria Missing", "Please select at least one duplicate removal criteria (Folder, Title, or URL).")
+            return
 
         save_path, _ = QFileDialog.getSaveFileName(
             self,
@@ -246,44 +282,53 @@ class BookmarkMergerApp(QWidget):
         self.status_lbl.setText("Merging...")
         QApplication.processEvents()
 
-        seen_urls = set()
+        seen_keys = set()
         merged_bookmarks = []
         duplicate_count = 0
-        remove_duplicates = self.chk_deduplicate.isChecked()
+        
+        def get_key(item, path):
+            k = []
+            if crit_folder:
+                k.append(path)
+            if crit_url:
+                k.append(item.get('url'))
+            if crit_title:
+                k.append(item.get('title'))
+            return tuple(k)
 
-        def recursive_merge(target, source):
+        def recursive_merge(target, source, current_path=()):
             nonlocal duplicate_count
             for item in source:
                 if item['type'] == 'folder':
                     # Check if folder exists in target
                     found = None
+                    folder_title = item.get('title', 'No Title')
+                    
+                    # Merge folders if they have same title (always merge structure)
                     for t in target:
-                        if t['type'] == 'folder' and t['title'] == item['title']:
+                        if t['type'] == 'folder' and t['title'] == folder_title:
                             found = t
                             break
                     if found:
-                        recursive_merge(found['children'], item['children'])
+                        recursive_merge(found['children'], item['children'], current_path + (folder_title,))
                     else:
                         new_folder = {
                             'type': 'folder',
-                            'title': item.get('title'),
+                            'title': folder_title,
                             'add_date': item.get('add_date'),
                             'last_modified': item.get('last_modified'),
                             'children': []
                         }
                         target.append(new_folder)
-                        recursive_merge(new_folder['children'], item['children'])
+                        recursive_merge(new_folder['children'], item['children'], current_path + (folder_title,))
                         
                 elif item['type'] == 'bookmark':
-                    url = item.get('url')
-                    if not url:
-                        continue
-                        
                     if remove_duplicates:
-                        if url in seen_urls:
+                        key = get_key(item, current_path)
+                        if key in seen_keys:
                             duplicate_count += 1
                         else:
-                            seen_urls.add(url)
+                            seen_keys.add(key)
                             target.append(item)
                     else:
                         target.append(item)
@@ -293,6 +338,7 @@ class BookmarkMergerApp(QWidget):
             recursive_merge(merged_bookmarks, bookmarks)
         
         result = generate_netscape_html(merged_bookmarks, save_path)
+
         
         if result is True:
             QMessageBox.information(self, "Success", f"Successfully merged bookmarks.\nIgnored {duplicate_count} duplicates.\nSaved to: {save_path}")
