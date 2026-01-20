@@ -8,33 +8,86 @@ from PySide6.QtCore import Qt
 def parse_bookmarks(file_path):
     """
     Parses a Netscape format bookmark file.
-    Returns a list of bookmark dictionaries.
+    Returns a list of bookmark/folder dictionaries (hierarchical).
     """
-    bookmarks = []
+    root_bookmarks = []
     try:
         with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
             soup = BeautifulSoup(f, 'html.parser')
-            
-            for link in soup.find_all('a'):
-                url = link.get('href')
-                title = link.get_text()
-                add_date = link.get('add_date')
-                icon = link.get('icon')
-                
-                if url:
-                    bookmarks.append({
-                        'url': url,
-                        'title': title,
-                        'add_date': add_date,
-                        'icon': icon
-                    })
+            dl = soup.find('dl')
+            if dl:
+                root_bookmarks = process_dl(dl)
     except Exception as e:
         print(f"Error parsing {file_path}: {e}")
-    return bookmarks
+    return root_bookmarks
+
+def process_dl(dl_element):
+    items = []
+    for child in dl_element.children:
+        if child.name == 'dt':
+            items.extend(process_dt(child))
+        elif child.name == 'p':
+            items.extend(process_container(child))
+    return items
+
+def process_container(element):
+    items = []
+    for child in element.children:
+        if child.name == 'dt':
+            items.extend(process_dt(child))
+        elif child.name == 'p':
+            items.extend(process_container(child))
+    return items
+
+def process_dt(dt_element):
+    item = None
+    
+    # Check H3 (Folder) or A (Bookmark)
+    h3 = dt_element.find('h3', recursive=False)
+    a = dt_element.find('a', recursive=False)
+    
+    if h3:
+        item = {
+            'type': 'folder',
+            'title': h3.get_text(),
+            'add_date': h3.get('add_date'),
+            'last_modified': h3.get('last_modified'),
+            'children': []
+        }
+        dl = dt_element.find('dl', recursive=False)
+        if dl:
+            item['children'] = process_dl(dl)
+            
+    elif a:
+        item = {
+            'type': 'bookmark',
+            'title': a.get_text(),
+            'url': a.get('href'),
+            'add_date': a.get('add_date'),
+            'icon': a.get('icon')
+        }
+    
+    result = []
+    if item:
+        result.append(item)
+    
+    # Process "siblings" buried in children (due to parser nesting)
+    for child in dt_element.children:
+        if child is h3 or child is a:
+            continue
+        if child.name == 'dl': 
+            continue # Already handled as children
+            
+        if child.name == 'dt':
+            result.extend(process_dt(child))
+        elif child.name == 'p':
+            result.extend(process_container(child))
+            
+    return result
 
 def generate_netscape_html(bookmarks, output_file):
     """
-    Generates a Netscape Bookmark file from a list of bookmarks.
+    Generates a Netscape Bookmark file from a list of hierarchical bookmarks.
     """
     header = """<!DOCTYPE NETSCAPE-Bookmark-file-1>
 <!-- This is an automatically generated file.
@@ -50,28 +103,44 @@ def generate_netscape_html(bookmarks, output_file):
     try:
         with open(output_file, 'w', encoding='utf-8') as f:
             f.write(header)
-            for b in bookmarks:
-                url = b.get('url', '')
-                title = b.get('title', 'No Title')
-                add_date = b.get('add_date', '')
-                icon = b.get('icon', '')
-                
-                # Construct attributes
-                attr_str = f'HREF="{url}"'
-                if add_date:
-                    attr_str += f' ADD_DATE="{add_date}"'
-                if icon:
-                    attr_str += f' ICON="{icon}"'
-                
-                # Escape title for HTML to be safe
-                safe_title = title.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-                
-                f.write(f'    <DT><A {attr_str}>{safe_title}</A>\n')
-                
+            write_items(f, bookmarks, 1)
             f.write(footer)
         return True
     except Exception as e:
         return str(e)
+
+def write_items(f, items, indent_level):
+    indent = "    " * indent_level
+    for item in items:
+        if item.get('type') == 'folder':
+            title = escape_html(item.get('title', 'No Title'))
+            add_date = item.get('add_date', '')
+            last_modified = item.get('last_modified', '')
+            
+            attr_str = ''
+            if add_date: attr_str += f' ADD_DATE="{add_date}"'
+            if last_modified: attr_str += f' LAST_MODIFIED="{last_modified}"'
+            
+            f.write(f'{indent}<DT><H3{attr_str}>{title}</H3>\n')
+            f.write(f'{indent}<DL><p>\n')
+            write_items(f, item.get('children', []), indent_level + 1)
+            f.write(f'{indent}</DL><p>\n')
+            
+        elif item.get('type') == 'bookmark':
+            title = escape_html(item.get('title', 'No Title'))
+            url = item.get('url', '')
+            add_date = item.get('add_date', '')
+            icon = item.get('icon', '')
+            
+            attr_str = f'HREF="{url}"'
+            if add_date: attr_str += f' ADD_DATE="{add_date}"'
+            if icon: attr_str += f' ICON="{icon}"'
+            
+            f.write(f'{indent}<DT><A {attr_str}>{title}</A>\n')
+
+def escape_html(text):
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
 
 class BookmarkMergerApp(QWidget):
     def __init__(self):
@@ -182,26 +251,51 @@ class BookmarkMergerApp(QWidget):
         duplicate_count = 0
         remove_duplicates = self.chk_deduplicate.isChecked()
 
+        def recursive_merge(target, source):
+            nonlocal duplicate_count
+            for item in source:
+                if item['type'] == 'folder':
+                    # Check if folder exists in target
+                    found = None
+                    for t in target:
+                        if t['type'] == 'folder' and t['title'] == item['title']:
+                            found = t
+                            break
+                    if found:
+                        recursive_merge(found['children'], item['children'])
+                    else:
+                        new_folder = {
+                            'type': 'folder',
+                            'title': item.get('title'),
+                            'add_date': item.get('add_date'),
+                            'last_modified': item.get('last_modified'),
+                            'children': []
+                        }
+                        target.append(new_folder)
+                        recursive_merge(new_folder['children'], item['children'])
+                        
+                elif item['type'] == 'bookmark':
+                    url = item.get('url')
+                    if not url:
+                        continue
+                        
+                    if remove_duplicates:
+                        if url in seen_urls:
+                            duplicate_count += 1
+                        else:
+                            seen_urls.add(url)
+                            target.append(item)
+                    else:
+                        target.append(item)
+
         for file_path in self.file_list:
             bookmarks = parse_bookmarks(file_path)
-            for b in bookmarks:
-                url = b.get('url')
-                if not url:
-                    continue
-
-                if remove_duplicates:
-                    if url not in seen_urls:
-                        seen_urls.add(url)
-                        merged_bookmarks.append(b)
-                    else:
-                        duplicate_count += 1
-                else:
-                    merged_bookmarks.append(b)
+            recursive_merge(merged_bookmarks, bookmarks)
         
         result = generate_netscape_html(merged_bookmarks, save_path)
         
         if result is True:
-            QMessageBox.information(self, "Success", f"Successfully merged {len(merged_bookmarks)} bookmarks.\nIgnored {duplicate_count} duplicates.\nSaved to: {save_path}")
+            QMessageBox.information(self, "Success", f"Successfully merged bookmarks.\nIgnored {duplicate_count} duplicates.\nSaved to: {save_path}")
             self.status_lbl.setText("Merge complete.")
         else:
             QMessageBox.critical(self, "Error", f"Failed to save file: {result}")
